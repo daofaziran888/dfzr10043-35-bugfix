@@ -295,29 +295,39 @@ def rotate_credential(cred_id: int, operator: str = "system") -> dict[str, Any]:
 
 def match_exception_and_retry(exception_signature: str, rule_id: int,
                                policy_id: int | None = None) -> dict[str, Any]:
-    """匹配异常规则，按关联的重试策略执行重试或放弃，并写入审计轨迹。"""
+    """匹配异常规则，按关联的重试策略执行重试或放弃，并写入审计轨迹。
+
+    归属修正：策略只按传入规则的「规则编号」关联，不再拿到别的规则的策略；
+    次数扣减走 RetryPolicyService.attempt_recovery，只影响该策略自身。
+    """
     rule_svc = service_for("exception_rule")
     rule = _find_entry("exception_rule", rule_id)
     rule_svc.run_action(rule_id, "启效规则")
 
-    # 获取关联重试策略
+    # 获取关联重试策略：只认本规则编号关联的策略
     retry_svc = service_for("retry_policy")
     if policy_id is None:
-        all_policies = retry_svc.list_entries(size=1000)[0]
-        matching = [p for p in all_policies if p.get("关联规则") == rule.get("规则编号")]
-        if not matching:
+        policy = retry_svc.get_policy_by_rule(rule.get("规则编号", ""))
+        if policy is None:
             return {"status": "no_policy", "reason": "无关联重试策略，异常未处理"}
-        policy = matching[0]
         policy_id = policy["id"]
 
     policy = _find_entry("retry_policy", policy_id)
+    # 跨规则防护：显式传入的策略也必须真正关联该规则
+    if policy.get("关联规则") != rule.get("规则编号"):
+        return {
+            "status": "policy_mismatch",
+            "reason": (
+                f"策略{policy.get('策略编号')}关联规则{policy.get('关联规则')}"
+                f"与命中规则{rule.get('规则编号')}不一致，拒绝执行"
+            ),
+        }
     retry_svc.run_action(policy_id, "启用策略")
 
-    # 模拟重试执行：读退避参数
     max_attempts = int(policy.get("最大次数", "3"))
-    current_retries = int(policy.get("累计重试", "0"))
+    remaining = retry_svc.remaining_attempts(policy_id)
 
-    if current_retries >= max_attempts:
+    if remaining <= 0:
         # 达到放弃阈值，标记放弃，写审计
         retry_svc.run_action(policy_id, "标记放弃")
         audit_svc = service_for("audit_trail")
@@ -334,29 +344,60 @@ def match_exception_and_retry(exception_signature: str, rule_id: int,
         audit_result, _ = audit_svc.create_entry(audit_values)
         return {
             "status": "abandoned",
-            "attempts": current_retries + 1,
+            "attempts": int(policy.get("累计重试", "0")) + 1,
             "max_attempts": max_attempts,
             "audit_id": audit_result["id"],
         }
 
-    # 仍在重试中，模拟一次重试
-    retry_svc.run_action(policy_id, "启用策略")
+    # 兑现一次重试（仅扣减本策略剩余次数）
+    attempt = retry_svc.attempt_recovery(policy_id)
+    if not attempt.get("ok"):
+        # 剩余次数在兑现瞬间耗尽：转放弃并写放弃审计
+        retry_svc.run_action(policy_id, "标记放弃")
+        audit_svc = service_for("audit_trail")
+        audit_values = {
+            "条目编号": f"AUDI-R{policy_id}",
+            "操作对象": f"重试策略.{policy.get('策略编号', '')}",
+            "操作类型": "重试放弃",
+            "操作者标识": "system",
+            "操作时间": _now_iso(),
+            "变更摘要": f"异常{exception_signature}处置次数耗尽，策略标记为已放弃",
+            "关联执行": "",
+            "追溯标记": f"retry-abandon-{_epoch_ms()}",
+        }
+        audit_result, _ = audit_svc.create_entry(audit_values)
+        return {
+            "status": "abandoned",
+            "attempts": int(policy.get("累计重试", "0")),
+            "max_attempts": max_attempts,
+            "rule_id": rule_id,
+            "rule_code": rule.get("规则编号"),
+            "policy_id": policy_id,
+            "audit_id": audit_result["id"],
+        }
     audit_svc = service_for("audit_trail")
     audit_values = {
-        "条目编号": f"AUDI-R{policy_id}-A{current_retries + 1}",
+        "条目编号": f"AUDI-R{policy_id}-A{attempt['total_retries']}",
         "操作对象": f"重试策略.{policy.get('策略编号', '')}",
         "操作类型": "重试执行",
         "操作者标识": "system",
         "操作时间": _now_iso(),
-        "变更摘要": f"异常{exception_signature}第{current_retries + 1}/{max_attempts}次重试",
+        "变更摘要": (
+            f"异常{exception_signature}第{attempt['total_retries']}/{max_attempts}"
+            f"次重试，采用规则{rule.get('规则编号')}"
+        ),
         "关联执行": "",
         "追溯标记": f"retry-attempt-{_epoch_ms()}",
     }
     audit_result, _ = audit_svc.create_entry(audit_values)
     return {
         "status": "retrying",
-        "attempt": current_retries + 1,
+        "attempt": attempt["total_retries"],
         "max_attempts": max_attempts,
+        "rule_id": rule_id,
+        "rule_code": rule.get("规则编号"),
+        "policy_id": policy_id,
+        "remaining": attempt["remaining"],
         "audit_id": audit_result["id"],
     }
 
@@ -364,32 +405,57 @@ def match_exception_and_retry(exception_signature: str, rule_id: int,
 # ── 链路5: 元素定位漂移 → 流程执行异常 → 异常规则匹配 ─
 
 def detect_element_drift(locator_id: int, flow_run_id: int) -> dict[str, Any]:
-    """检测元素定位漂移，关联流程执行触发异常规则处理。"""
+    """检测元素定位漂移，按失败所属模板仲裁异常规则并写入恢复清单。
+
+    归属修正：规则必须对定位所属模板有权采用（自有同模板或共享），
+    漂移事件不会再串位到其他模板的规则；仲裁结论唯一进入恢复清单。
+
+    这里只做「归属核验 + 规则仲裁 + 入恢复清单」，不直接消耗重试次数——
+    被采用规则允许的处置在值班员按清单派发时才唯一兑现一次
+    （见 RecoveryService.dispatch_recovery）。
+    """
     loc_svc = service_for("element_locator")
     loc = _find_entry("element_locator", locator_id)
     loc_svc.run_action(locator_id, "标记漂移")
 
     run_entry = _find_entry("flow_run", flow_run_id)
+    template_code = loc.get("所属模板", "") or run_entry.get("关联模板", "")
+    signature = f"元素定位漂移:{loc.get('定位编号')}:flow_run_{flow_run_id}"
 
-    # 查找匹配的异常规则
+    # 归属核验后的规则仲裁：自有优先、共享兜底，只返回对本模板有权的规则
     rule_svc = service_for("exception_rule")
-    all_rules = rule_svc.list_entries(size=1000)[0]
-    matching_rule = None
-    for rule in all_rules:
-        if rule.get("status") in ("已生效",) and rule.get("适用范围", "").find("定位") >= 0:
-            matching_rule = rule
-            break
+    winner, candidates = rule_svc.match_for_failure(signature, template_code, "定位")
+    if winner is None:
+        return {
+            "status": "drifted_no_rule",
+            "locator_id": locator_id,
+            "drifted": True,
+            "template_code": template_code,
+        }
 
-    if matching_rule:
-        result = match_exception_and_retry(
-            f"元素定位漂移:{loc.get('定位编号')}:flow_run_{flow_run_id}",
-            matching_rule["id"]
-        )
-        result["locator_id"] = locator_id
-        result["drifted"] = True
-        return result
+    # 唯一结论写入恢复清单（幂等），原匹配历史一并留痕；不在此扣减重试次数
+    from app.services.recovery import RecoveryService
+    recovery_svc = RecoveryService()
+    resolved = recovery_svc.resolve_failure(
+        signature, template_code, flow_run_id=flow_run_id,
+        scope="定位", source="元素定位漂移",
+    )
+    resolution = recovery_svc.get_resolution(resolved["resolution_id"])
 
-    return {"status": "drifted_no_rule", "locator_id": locator_id, "drifted": True}
+    return {
+        "status": "queued",
+        "locator_id": locator_id,
+        "drifted": True,
+        "template_code": template_code,
+        "winner_rule_id": winner["id"],
+        "winner_rule_code": winner.get("规则编号"),
+        "candidate_rule_ids": [r["id"] for r in candidates],
+        "failure_key": resolved.get("failure_key"),
+        "resolution_id": resolved.get("resolution_id"),
+        "resolution_status": resolution.get("清单状态"),
+        "recovery_condition": resolution.get("恢复条件"),
+        "capture_scope": resolution.get("采集范围"),
+    }
 
 
 # ── 链路6: 表单字段校验 → 步骤轨迹异常 → 重试恢复 ─
@@ -415,15 +481,14 @@ def validate_form_field(field_id: int, trace_id: int) -> dict[str, Any]:
         trace = _find_entry("step_trace", trace_id)
         trace_svc.run_action(trace_id, "标记异常")
 
-        # 触发重试恢复
+        # 触发重试恢复：按字段失败特征与字段所属模板做归属核验
         rule_svc = service_for("exception_rule")
-        all_rules = rule_svc.list_entries(size=1000)[0]
-        for rule in all_rules:
-            if rule.get("status") == "已生效" and rule.get("适用范围", "").find("字段") >= 0:
-                return match_exception_and_retry(
-                    f"表单字段校验失败:{field.get('字段编号')}:trace_{trace_id}",
-                    rule["id"]
-                )
+        signature = f"表单字段校验失败:{field.get('字段编号')}:trace_{trace_id}"
+        winner, _ = rule_svc.match_for_failure(
+            signature, field.get("关联模板", ""), "字段"
+        )
+        if winner is not None:
+            return match_exception_and_retry(signature, winner["id"])
 
     return {"status": "validated", "field_id": field_id, "is_valid": is_valid}
 

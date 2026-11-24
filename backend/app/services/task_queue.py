@@ -18,6 +18,7 @@ class TaskQueueService(BaseModuleService):
     LIST_FIELDS = [
         "队列编号", "关联模板", "优先级", "期望开始", "重试次数",
         "占用节点", "等待秒数", "入队时间",
+        "failure_key", "采用规则编号", "恢复执行号", "采集范围", "派发回执",
     ]
     REQUIRED_FIELDS = ["队列编号", "关联模板", "优先级"]
     STATUS_ORDER = ["待派发", "已派发", "已消费", "已丢弃"]
@@ -47,6 +48,11 @@ class TaskQueueService(BaseModuleService):
                 self.run_action(it["id"], "回收任务")
                 recycled += 1
         return {"ok": True, "recycled_count": recycled}
+
+    def get_pending_by_template(self, template_code: str) -> list[dict[str, Any]]:
+        """按归属模板返回待派发任务，供恢复清单核验后领取。"""
+        pending = self.get_pending_by_priority()
+        return [t for t in pending if t.get("关联模板") == template_code]
 
     def dispatch_to_node(self, task_id: int, node_code: str) -> dict[str, Any]:
         """将任务派发到指定节点。"""
